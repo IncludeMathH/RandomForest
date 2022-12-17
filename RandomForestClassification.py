@@ -1,19 +1,9 @@
-# -*- coding: utf-8 -*-
-"""
-@Env: Python2.7
-@Time: 2019/10/24 13:31
-@Author: zhaoxingfeng
-@Function：Random Forest（RF），随机森林二分类
-@Version: V1.2
-参考文献：
-[1] UCI. wine[DB/OL].https://archive.ics.uci.edu/ml/machine-learning-databases/wine.
-"""
 import pandas as pd
 import numpy as np
 import random
 import math
 import collections
-from sklearn.externals.joblib import Parallel, delayed
+from joblib import Parallel, delayed
 
 
 class Tree(object):
@@ -50,7 +40,8 @@ class Tree(object):
 
 class RandomForestClassifier(object):
     def __init__(self, n_estimators=10, max_depth=-1, min_samples_split=2, min_samples_leaf=1,
-                 min_split_gain=0.0, colsample_bytree=None, subsample=0.8, random_state=None):
+                 min_split_gain=0.0, colsample_bytree=None, subsample=0.8, random_state=None,
+                 describe_tree=False):
         """
         随机森林参数
         ----------
@@ -63,6 +54,8 @@ class RandomForestClassifier(object):
                            log2表示随机选择log(n_features)个特征，设置为其他则不进行列采样
         subsample:         行采样比例
         random_state:      随机种子，设置之后每次生成的n_estimators个样本集不会变，确保实验可重复
+        describe_tree:     是否输出每棵树的信息
+
         """
         self.n_estimators = n_estimators
         self.max_depth = max_depth if max_depth != -1 else float('inf')
@@ -74,6 +67,10 @@ class RandomForestClassifier(object):
         self.random_state = random_state
         self.trees = None
         self.feature_importances_ = dict()
+        self.describe_tree = describe_tree
+        # 存放oob错误率
+        self.oob_errors_ = []
+        self.oob_probs = {}
 
     def fit(self, dataset, targets):
         """模型训练入口"""
@@ -89,6 +86,8 @@ class RandomForestClassifier(object):
             self.colsample_bytree = int(len(dataset.columns) ** 0.5)
         elif self.colsample_bytree == "log2":
             self.colsample_bytree = int(math.log(len(dataset.columns)))
+        elif isinstance(self.colsample_bytree, int):
+            pass
         else:
             self.colsample_bytree = len(dataset.columns)
 
@@ -107,7 +106,9 @@ class RandomForestClassifier(object):
                                         random_state=random_state).reset_index(drop=True)
 
         tree = self._build_single_tree(dataset_stage, targets_stage, depth=0)
-        print(tree.describe_tree())
+        if self.describe_tree:
+            print(tree.describe_tree())
+        print('A tree has been built!')
         return tree
 
     def _build_single_tree(self, dataset, targets, depth):
