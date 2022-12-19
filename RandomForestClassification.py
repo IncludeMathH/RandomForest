@@ -4,10 +4,12 @@ import random
 import math
 import collections
 from joblib import Parallel, delayed
+from sklearn.utils import resample
 
 
 class Tree(object):
     """定义一棵决策树"""
+
     def __init__(self):
         self.split_feature = None
         self.split_value = None
@@ -68,9 +70,7 @@ class RandomForestClassifier(object):
         self.trees = None
         self.feature_importances_ = dict()
         self.describe_tree = describe_tree
-        # 存放oob错误率
-        self.oob_errors_ = []
-        self.oob_probs = {}
+        self.oob_probs = collections.defaultdict(list)   # 存放oob样本的预测结果
 
     def fit(self, dataset, targets):
         """模型训练入口"""
@@ -94,21 +94,30 @@ class RandomForestClassifier(object):
         # 并行建立多棵决策树
         self.trees = Parallel(n_jobs=-1, verbose=0, backend="threading")(
             delayed(self._parallel_build_trees)(dataset, targets, random_state)
-                for random_state in random_state_stages)
-        
+            for random_state in random_state_stages)
+
     def _parallel_build_trees(self, dataset, targets, random_state):
         """bootstrap有放回抽样生成训练样本集，建立决策树"""
         subcol_index = random.sample(dataset.columns.tolist(), self.colsample_bytree)
-        dataset_stage = dataset.sample(n=int(self.subsample * len(dataset)), replace=True, 
-                                        random_state=random_state).reset_index(drop=True)
+        n_samples = len(dataset)  # 数据集个数
+        dataset_stage, selected_sample = resample(dataset, list(range(n_samples)),
+                                                  n_samples=int(self.subsample * n_samples), random_state=random_state)
+        dataset_stage = dataset_stage.reset_index(drop=True)
         dataset_stage = dataset_stage.loc[:, subcol_index]
-        targets_stage = targets.sample(n=int(self.subsample * len(dataset)), replace=True, 
-                                        random_state=random_state).reset_index(drop=True)
+
+        targets_stage = targets.loc[selected_sample, :].reset_index(drop=True)
 
         tree = self._build_single_tree(dataset_stage, targets_stage, depth=0)
         if self.describe_tree:
             print(tree.describe_tree())
         print('A tree has been built!')
+
+        # ================oob进行模型选择====================
+        oob_indexes = [data_index for data_index in range(n_samples) if data_index not in selected_sample]
+        for oob_index, oob_data in dataset.loc[oob_indexes].iterrows():
+            oob_predict = tree.calc_predict_value(oob_data)
+            self.oob_probs[oob_index].append(oob_predict)
+
         return tree
 
     def _build_single_tree(self, dataset, targets, depth):
@@ -138,8 +147,8 @@ class RandomForestClassifier(object):
 
                 tree.split_feature = best_split_feature
                 tree.split_value = best_split_value
-                tree.tree_left = self._build_single_tree(left_dataset, left_targets, depth+1)
-                tree.tree_right = self._build_single_tree(right_dataset, right_targets, depth+1)
+                tree.tree_left = self._build_single_tree(left_dataset, left_targets, depth + 1)
+                tree.tree_right = self._build_single_tree(right_dataset, right_targets, depth + 1)
                 return tree
         # 如果树的深度超过预设值，则终止分裂
         else:
@@ -203,19 +212,37 @@ class RandomForestClassifier(object):
         right_targets = targets[dataset[split_feature] > split_value]
         return left_dataset, right_dataset, left_targets, right_targets
 
-    def predict(self, dataset):
+    def predict(self, dataset, return_prob=False):
         """输入样本，预测所属类别"""
         res = []
+        probs = []
         for _, row in dataset.iterrows():
             pred_list = []
             # 统计每棵树的预测结果，选取出现次数最多的结果作为最终类别
             for tree in self.trees:
                 pred_list.append(tree.calc_predict_value(row))
 
-            pred_label_counts = collections.Counter(pred_list)
-            pred_label = max(zip(pred_label_counts.values(), pred_label_counts.keys()))
+            pred_label_counts = collections.Counter(pred_list)  # Counter({1: x, 2: y})
+            pred_label = max(zip(pred_label_counts.values(), pred_label_counts.keys()))  # (票数，标签）
+            prob = pred_label_counts[1] / self.n_estimators
             res.append(pred_label[1])
+            probs.append(prob)
+        if return_prob:
+            return np.array(res), np.array(probs)
         return np.array(res)
+
+    def oob_errors(self, targets):
+        oob_incorrect = 0  # the number of incorrect predictions of OOB samples
+        for oob_index, oob_prob in self.oob_probs.items():
+            pred_label_counts = collections.Counter(oob_prob)  # Counter({1: x, 2: y})
+            pred_label = max(zip(pred_label_counts.values(), pred_label_counts.keys()))  # (票数，标签）
+            print(f'pred_label[1]:{pred_label[1]}, type={type(pred_label[1])}')
+            # print(f'targets:{targets.loc[oob_index].values}, type={type(targets.loc[oob_index].values)}')
+            if pred_label[1] != targets.loc[oob_index]:
+                oob_incorrect += 1
+
+        oob_error = oob_incorrect / len(self.oob_probs)
+        print(f'the oob_error of tree: {oob_error}')
 
 
 if __name__ == '__main__':
@@ -230,11 +257,16 @@ if __name__ == '__main__':
                                  subsample=0.8,
                                  random_state=66)
     train_count = int(0.7 * len(df))
-    feature_list = ["Alcohol", "Malic acid", "Ash", "Alcalinity of ash", "Magnesium", "Total phenols", 
-                    "Flavanoids", "Nonflavanoid phenols", "Proanthocyanins", "Color intensity", "Hue", 
+    feature_list = ["Alcohol", "Malic acid", "Ash", "Alcalinity of ash", "Magnesium", "Total phenols",
+                    "Flavanoids", "Nonflavanoid phenols", "Proanthocyanins", "Color intensity", "Hue",
                     "OD280/OD315 of diluted wines", "Proline"]
     clf.fit(df.loc[:train_count, feature_list], df.loc[:train_count, 'label'])
 
-    from sklearn import metrics
-    print(metrics.accuracy_score(df.loc[:train_count, 'label'], clf.predict(df.loc[:train_count, feature_list])))
-    print(metrics.accuracy_score(df.loc[train_count:, 'label'], clf.predict(df.loc[train_count:, feature_list])))
+    from sklearn.metrics import accuracy_score, average_precision_score
+
+    print(accuracy_score(df.loc[:train_count, 'label'], clf.predict(df.loc[:train_count, feature_list])))
+
+    y_pred, y_prob = clf.predict(df.loc[train_count:, feature_list], return_prob=True)
+    print(accuracy_score(df.loc[train_count:, 'label'], y_pred))
+    print('AUPRC', average_precision_score(df.loc[train_count:, 'label'], y_prob))
+    oob_error = clf.oob_errors(df.loc[:train_count, 'label'])
