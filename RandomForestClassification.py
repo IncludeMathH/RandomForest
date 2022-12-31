@@ -43,7 +43,7 @@ class Tree(object):
 class RandomForestClassifier(object):
     def __init__(self, n_estimators=10, max_depth=-1, min_samples_split=2, min_samples_leaf=1,
                  min_split_gain=0.0, colsample_bytree=None, subsample=0.8, random_state=None,
-                 describe_tree=False):
+                 describe_tree=False, oob_score=False):
         """
         随机森林参数
         ----------
@@ -57,6 +57,7 @@ class RandomForestClassifier(object):
         subsample:         行采样比例
         random_state:      随机种子，设置之后每次生成的n_estimators个样本集不会变，确保实验可重复
         describe_tree:     是否输出每棵树的信息
+        oob_score:         是否记录oob样本的信息并进行oob error的计算
 
         """
         self.n_estimators = n_estimators
@@ -70,6 +71,7 @@ class RandomForestClassifier(object):
         self.trees = None
         self.feature_importances_ = dict()
         self.describe_tree = describe_tree
+        self.oob_score = oob_score                       # 若为True,则记录oob有关的信息。代码效率会降低
         self.oob_probs = collections.defaultdict(list)   # 存放oob样本的预测结果
 
     def fit(self, dataset, targets):
@@ -97,15 +99,15 @@ class RandomForestClassifier(object):
             for random_state in random_state_stages)
 
     def _parallel_build_trees(self, dataset, targets, random_state):
-        """bootstrap有放回抽样生成训练样本集，建立决策树"""
-        subcol_index = random.sample(dataset.columns.tolist(), self.colsample_bytree)
         n_samples = len(dataset)  # 数据集个数
-        dataset_stage, selected_sample = resample(dataset, list(range(n_samples)),
-                                                  n_samples=int(self.subsample * n_samples), random_state=random_state)
-        dataset_stage = dataset_stage.reset_index(drop=True)
+        subcol_index = random.sample(dataset.columns.tolist(), self.colsample_bytree)
+        dataset_stage = dataset.sample(n=int(self.subsample * n_samples), replace=True,
+                                       random_state=random_state).reset_index(drop=True)
         dataset_stage = dataset_stage.loc[:, subcol_index]
-
-        targets_stage = targets.loc[selected_sample, :].reset_index(drop=True)
+        targets_stage = targets.sample(n=int(self.subsample * n_samples), replace=True,
+                                       random_state=random_state)
+        selected_index = targets_stage.index
+        targets_stage = targets_stage.reset_index(drop=True)
 
         tree = self._build_single_tree(dataset_stage, targets_stage, depth=0)
         if self.describe_tree:
@@ -113,10 +115,12 @@ class RandomForestClassifier(object):
         print('A tree has been built!')
 
         # ================oob进行模型选择====================
-        oob_indexes = [data_index for data_index in range(n_samples) if data_index not in selected_sample]
-        for oob_index, oob_data in dataset.loc[oob_indexes].iterrows():
-            oob_predict = tree.calc_predict_value(oob_data)
-            self.oob_probs[oob_index].append(oob_predict)
+        if self.oob_score:
+            oob_indexes = [data_index for data_index in range(n_samples) if data_index not in selected_index]
+            for oob_index, oob_data in dataset.loc[oob_indexes].iterrows():
+                oob_predict = tree.calc_predict_value(oob_data)   # 0 or 1
+                self.oob_probs[oob_index].append(oob_predict)
+        # self.oob_errors(targets)
 
         return tree
 
@@ -212,19 +216,22 @@ class RandomForestClassifier(object):
         right_targets = targets[dataset[split_feature] > split_value]
         return left_dataset, right_dataset, left_targets, right_targets
 
-    def predict(self, dataset, return_prob=False):
+    def predict(self, dataset, return_prob=False, num_trees=-1):
         """输入样本，预测所属类别"""
         res = []
         probs = []
+        if num_trees == -1:
+            num_trees = self.n_estimators
         for _, row in dataset.iterrows():
             pred_list = []
             # 统计每棵树的预测结果，选取出现次数最多的结果作为最终类别
-            for tree in self.trees:
-                pred_list.append(tree.calc_predict_value(row))
+            for i, tree in enumerate(self.trees):
+                if i < num_trees:
+                    pred_list.append(tree.calc_predict_value(row))
 
             pred_label_counts = collections.Counter(pred_list)  # Counter({1: x, 2: y})
             pred_label = max(zip(pred_label_counts.values(), pred_label_counts.keys()))  # (票数，标签）
-            prob = pred_label_counts[1] / self.n_estimators
+            prob = pred_label_counts[1] / num_trees
             res.append(pred_label[1])
             probs.append(prob)
         if return_prob:
@@ -232,17 +239,21 @@ class RandomForestClassifier(object):
         return np.array(res)
 
     def oob_errors(self, targets):
+        if self.oob_score is not True:
+            print('oob_score is False, so no oob error can be generated.')
+            return
         oob_incorrect = 0  # the number of incorrect predictions of OOB samples
         for oob_index, oob_prob in self.oob_probs.items():
             pred_label_counts = collections.Counter(oob_prob)  # Counter({1: x, 2: y})
-            pred_label = max(zip(pred_label_counts.values(), pred_label_counts.keys()))  # (票数，标签）
-            print(f'pred_label[1]:{pred_label[1]}, type={type(pred_label[1])}')
+            pred_label = max(zip(pred_label_counts.values(), pred_label_counts.keys()))  # 得票最多的（票数，标签）
+            # print(f'pred_label[1]:{pred_label[1]}, type={type(pred_label[1])}')
             # print(f'targets:{targets.loc[oob_index].values}, type={type(targets.loc[oob_index].values)}')
             if pred_label[1] != targets.loc[oob_index]:
                 oob_incorrect += 1
 
         oob_error = oob_incorrect / len(self.oob_probs)
-        print(f'the oob_error of tree: {oob_error}')
+        # print(f'the oob_error of tree: {oob_error}')
+        return oob_error
 
 
 if __name__ == '__main__':
